@@ -1,0 +1,656 @@
+---
+title: "Manager Gender and Technology Adoption in Peruvian Firms, 2010–2023"
+subtitle: "Econometric Analysis of Firm Data (KAN-CEAPV2505U) — full analysis notebook"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "")
+```
+
+# Overview
+
+**Research question.** Are firms with a female top manager less likely to adopt technology — measured by having their **own website** and an **internationally recognised quality certification** — once unobserved, time-constant firm differences are taken into account? And how did the gap evolve across the three survey waves, including the wave after the COVID-19 pandemic?
+
+**Data.** World Bank Enterprise Surveys for Peru, three waves (2010, 2017, 2023) linked into an **unbalanced panel**.
+
+**Methods, in the order of the paper.**
+
+1. Pooled OLS linear probability model (LPM) as the baseline, with a short probit check of the functional form.
+2. Panel estimators on the unbalanced panel: pooled OLS, random effects (RE) and fixed effects (FE).
+3. The Mundlak (correlated random effects) test of RE against FE.
+4. Tests for sample selection (attrition) in unbalanced panels, following the course lecture on unbalanced panels.
+
+The notebook writes every table and figure used in the paper to `tables/` and `figures/`.
+
+**Required files (not distributed in the repository, see README):** download from the World Bank Enterprise Surveys portal and place in `data/`:
+
+- `Peru_2006_2010_2017.dta` — Peru Enterprise Survey 2006–2017, panel data (Ref. PER_2006-2017_ES-P_v01_M)
+- `Peru_2017_2023.dta` — Peru 2017–2023 panel file (contains the Peru WBES 2023, Ref. PER_2023_WBES_v01_M)
+
+```{r packages}
+library(haven)            # read Stata files
+library(dplyr)            # data handling
+library(plm)              # panel estimators (pooled OLS, FE, RE)
+library(sandwich)         # robust and clustered covariance matrices
+library(lmtest)           # coeftest, bptest
+library(ggplot2)          # figure
+dir.create("tables", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+```
+
+# Data construction
+
+## Recoding rules
+
+In the Enterprise Surveys, yes/no questions are coded 1 = yes, 2 = no, and negative values are non-responses (−9 don't know, −7 refused, −6 not applicable). Non-responses are set to missing.
+
+```{r helpers}
+yesno <- function(x) { x <- as.numeric(x); ifelse(x == 1, 1, ifelse(x == 2, 0, NA)) }
+nonneg <- function(x) { x <- as.numeric(x); ifelse(x < 0, NA, x) }
+```
+
+## Linking the two panel files
+
+The 2006–2017 panel file contains the 2010 wave; the 2017–2023 panel file contains the 2017 and 2023 waves. Both files contain the **same 2017 survey**, and every 2017 firm has the same identifier (`idstd`) in both files. The 2017 `idstd` therefore links firms across all three waves:
+
+- firms observed in 2017 get the key `S<idstd2017>` in both files;
+- firms observed only in 2010 (old file) or only in 2023 (new file) get a file-specific key.
+
+This rule can only link firms through the 2017 wave: a firm interviewed in 2010 and 2023 but not 2017 would get two different keys. Whether such firms exist is checked against the World Bank's own panel indicator (`panel`) in the 2017–2023 file, which classifies every 2023 firm as "2023 only" (fresh sample), "2017 and 2023" or "2023 with panelid but can not be matched". The 2023 panel component was drawn from the 2017 sample, so no 2023 firm is recorded as an earlier (2010) panel firm, and the files contain no identifier that would link 2010 to 2023 directly.
+
+```{r link}
+old <- read_dta("data/Peru_2006_2010_2017.dta")
+new <- read_dta("data/Peru_2017_2023.dta")
+
+# key for the 2017-2023 file
+new <- new %>%
+  group_by(panelid) %>%
+  mutate(id17 = ifelse(any(year == 2017), idstd[year == 2017][1], NA)) %>%
+  ungroup() %>%
+  mutate(key = ifelse(!is.na(id17), paste0("S", id17), paste0("N", panelid)))
+
+# key for the 2010 wave of the 2006-2017 file
+old <- old %>%
+  group_by(panelid) %>%
+  mutate(id17 = ifelse(any(year == 2017), idstd[year == 2017][1], NA)) %>%
+  ungroup() %>%
+  mutate(key = ifelse(!is.na(id17), paste0("S", id17), paste0("O", panelid)))
+
+# check: the 2017 identifiers are the same set in both files
+stopifnot(setequal(old$idstd[old$year == 2017], new$idstd[new$year == 2017]))
+
+# World Bank panel status of the 2023 firms: only fresh firms (2) or 2017 panel firms (3)
+print(table(year = new$year, panel = as_factor(new$panel)))
+stopifnot(all(new$panel[new$year == 2023] %in% c(2, 3)))
+```
+
+## Harmonising the variables
+
+Sector is coded differently in 2010, so I use three broad sectors that can be built consistently: manufacturing, retail and other services (2010: ISIC Rev. 3 two-digit code `a4b`; 2017/2023: harmonised sampling sector `a4a`).
+
+```{r variables}
+# validate the raw sector and region codes before classifying them (no negative or unexpected codes)
+print(table(old$a4b[old$year == 2010], useNA = "ifany"))
+print(table(new$year, new$a4a, useNA = "ifany"))
+print(table(c(old$a2[old$year == 2010], new$a2), useNA = "ifany"))
+stopifnot(all(old$a4b[old$year == 2010] %in% c(15:37, 45, 50:52, 55, 60, 72)),
+          all(new$a4a %in% 1:7), all(c(old$a2[old$year == 2010], new$a2) %in% 1:5))
+
+w10 <- old %>% filter(year == 2010) %>%
+  transmute(key, year = 2010,
+            female   = yesno(`_2010_2017_b7a`),
+            website  = yesno(c22b),
+            cert     = yesno(b8),
+            l1 = nonneg(l1), mgr_exp = nonneg(b7), d3c = nonneg(d3c), b2b = nonneg(b2b),
+            multi    = yesno(a7),
+            region   = as.numeric(a2),
+            sector   = case_when(a4b >= 15 & a4b <= 37 ~ "Manufacturing",
+                                 a4b == 52 ~ "Retail", TRUE ~ "Other services"))
+
+w1723 <- new %>%
+  transmute(key, year = as.numeric(year),
+            female   = yesno(b7a),
+            website  = yesno(c22b),
+            cert     = yesno(b8),
+            l1 = nonneg(l1), mgr_exp = nonneg(b7), d3c = nonneg(d3c), b2b = nonneg(b2b),
+            multi    = yesno(a7),
+            region   = as.numeric(a2),
+            sector   = case_when(a4a %in% 1:4 ~ "Manufacturing",
+                                 a4a == 5 ~ "Retail", TRUE ~ "Other services"))
+
+df <- bind_rows(w10, w1723) %>%
+  mutate(ln_emp    = ifelse(l1 > 0, log(l1), NA),
+         exporter  = as.numeric(d3c >= 10),
+         foreign   = as.numeric(b2b >= 10),
+         y2017     = as.numeric(year == 2017),
+         y2023     = as.numeric(year == 2023),
+         female_x23 = female * y2023,
+         sector    = factor(sector, levels = c("Manufacturing", "Retail", "Other services")),
+         region    = factor(region)) %>%
+  arrange(key, year)
+
+stopifnot(!any(duplicated(df[c("key", "year")])))
+cat("Observations:", nrow(df), " Firms:", n_distinct(df$key), "\n")
+table(df$year)
+```
+
+**Why "part of a larger firm" is not a control.** The share of firms reporting that they belong to a larger firm drops from about 20–25% in 2010 and 2017 to about 1% in 2023 (see the descriptive table). Such a drop is implausible as a real change and points to a change in the questionnaire. Inside FE it would create artificial within-firm changes, so the variable is reported descriptively but not used as a control.
+
+**Why firm age is not a control.** Age equals the survey year minus the founding year. With year dummies, the founding year is time-constant and is absorbed by the firm effect, so age cannot be separated from the year and firm effects in the FE model. To compare pooled OLS, RE and FE on the same specification, age is left out of all models.
+
+## Panel structure
+
+```{r structure}
+pattern <- df %>% group_by(key) %>%
+  summarise(waves = paste(sort(year), collapse = "-"), T_i = n(), .groups = "drop")
+pattern %>% count(waves, name = "firms") %>% arrange(desc(firms))
+cat("Firms observed in at least two waves:", sum(pattern$T_i >= 2), "\n")
+
+switchers <- df %>% filter(!is.na(female)) %>% group_by(key) %>%
+  summarise(n = n(), sw = n_distinct(female) > 1, .groups = "drop")
+cat("Of these, firms whose manager gender changes:", sum(switchers$sw), "\n")
+
+# sector and region recorded differently for the same firm in different waves
+multi <- df %>% group_by(key) %>% filter(n() >= 2)
+cat("Multi-wave firms whose recorded sector changes:", multi %>% summarise(s = n_distinct(sector) > 1) %>% pull(s) %>% sum(),
+    "| region changes:", multi %>% summarise(s = n_distinct(region) > 1) %>% pull(s) %>% sum(), "\n")
+```
+
+# Descriptive statistics
+
+```{r descriptives}
+desc_vars <- c(website = "Own website", cert = "Quality certification",
+               l1 = "Employees (permanent full-time)", mgr_exp = "Manager experience (years)",
+               exporter = "Exporter ($\\geq$10\\% of sales)", foreign = "Foreign owned ($\\geq$10\\%)",
+               multi = "Part of larger firm")
+desc <- df %>% filter(!is.na(female)) %>%
+  mutate(manuf = as.numeric(sector == "Manufacturing"), retail = as.numeric(sector == "Retail")) %>%
+  group_by(year, female) %>%
+  summarise(across(c(names(desc_vars), manuf, retail), ~ mean(.x, na.rm = TRUE)), n = n(), .groups = "drop")
+desc
+
+# raw female-male gaps with Welch t-tests, by wave
+for (v in c("website", "cert")) for (t in c(2010, 2017, 2023)) {
+  d <- df %>% filter(year == t, !is.na(female), !is.na(.data[[v]]))
+  tt <- t.test(d[[v]][d$female == 1], d[[v]][d$female == 0])
+  cat(sprintf("%-8s %d  gap (F-M) = %6.3f   p = %.3f\n", v, t, diff(rev(tt$estimate)), tt$p.value))
+}
+```
+
+```{r figure1, fig.width=8, fig.height=3.4}
+fig <- df %>% filter(!is.na(female)) %>%
+  tidyr::pivot_longer(c(website, cert), names_to = "outcome", values_to = "y") %>%
+  filter(!is.na(y)) %>%
+  group_by(outcome, year, female) %>% summarise(share = mean(y), .groups = "drop") %>%
+  mutate(outcome = recode(outcome, website = "Own website", cert = "Quality certification"),
+         Manager = factor(ifelse(female == 1, "Female top manager", "Male top manager"),
+                          levels = c("Male top manager", "Female top manager")))
+p <- ggplot(fig, aes(factor(year), share, fill = Manager)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(aes(label = scales::percent(share, accuracy = 1)),
+            position = position_dodge(width = 0.75), vjust = -0.4, size = 3, colour = "#52514e") +
+  facet_wrap(~ outcome) +
+  scale_fill_manual(values = c("Male top manager" = "#2a78d6", "Female top manager" = "#eb6834")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = NULL, y = "Share of firms", fill = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top", panel.grid.major.x = element_blank())
+p
+ggsave("figures/fig1_outcomes.pdf", p, width = 8, height = 3.4)
+```
+
+# Pooled OLS: the linear probability model
+
+## Model
+
+For outcome $y_{it}\in\{0,1\}$ of firm $i$ in wave $t$:
+
+$$
+y_{it} = \beta_0 + \beta_1 F_{it} + \beta_3 (F_{it}\times D^{2023}_t) + \delta_1 D^{2017}_t + \delta_2 D^{2023}_t + \mathbf x_{it}'\boldsymbol\gamma + v_{it}
+$$
+
+$E(y\mid\mathbf x) = P(y=1\mid\mathbf x)$, so coefficients are changes in probability. $\beta_1$ is the female–male gap before the pandemic (2010 and 2017), $\beta_1+\beta_3$ the gap in 2023, and $\beta_3$ the change in the gap.
+
+Pooled OLS treats the composite error $v_{it} = a_i + u_{it}$ as one error. It is consistent only if $a_i$ is uncorrelated with the regressors, and the errors of the same firm are correlated over time, so standard errors are **clustered by firm**. The LPM error is heteroskedastic by construction ($\text{Var}(v\mid\mathbf x) = p(\mathbf x)[1-p(\mathbf x)]$), which clustering also handles.
+
+```{r pols}
+ctrl_tv <- c("ln_emp", "mgr_exp", "exporter", "foreign")      # time-varying controls (see note on "multi" above)
+rhs     <- paste(c("female", "female_x23", "y2017", "y2023", ctrl_tv), collapse = " + ")
+rhs_tc  <- paste(rhs, "+ sector + region")                               # + time-constant controls
+
+est_sample <- function(v) df %>% filter(if_all(all_of(c(v, "female", ctrl_tv, "sector", "region")), ~ !is.na(.x)))
+pdat <- function(v) pdata.frame(as.data.frame(est_sample(v)), index = c("key", "year"))
+
+cl_vcov <- function(m) vcovHC(m, method = "arellano", type = "HC1", cluster = "group")
+
+pols <- list(); for (v in c("website", "cert")) {
+  pols[[v]] <- plm(as.formula(paste(v, "~", rhs_tc)), data = pdat(v), model = "pooling")
+  cat("\n====", v, "====\n"); print(coeftest(pols[[v]], vcov = cl_vcov(pols[[v]]))[c("female", "female_x23"), ])
+}
+```
+
+### Assumption checks for the LPM
+
+```{r lpm_checks}
+for (v in c("website", "cert")) {
+  m  <- lm(as.formula(paste(v, "~", rhs_tc)), data = est_sample(v))
+  bp <- bptest(m)
+  fv <- fitted(m)
+  cat(sprintf("%-8s Breusch-Pagan p = %.4f | fitted values outside [0,1]: %.1f%%\n",
+              v, bp$p.value, 100 * mean(fv < 0 | fv > 1)))
+}
+```
+
+## Probit check of the functional form
+
+Probit models $P(y=1\mid\mathbf x) = \Phi(\mathbf x'\boldsymbol\beta)$ and keeps predictions in $[0,1]$. Coefficients are not partial effects, so I report **average partial effects** (APEs) of being female-led, separately for the pre-pandemic waves and 2023, and their difference — the probability-scale counterpart of $\beta_3$ (the coefficient on an interaction in a nonlinear model is not itself the interaction effect). Standard errors come from a firm-cluster bootstrap (199 replications).
+
+```{r probit}
+probit_ape <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% mutate(post = factor(y2023))
+  m <- glm(as.formula(paste(v, "~", rhs_tc)), family = binomial(link = "probit"), data = d)
+  # average discrete change of female 0 -> 1 (female_x23 updated consistently),
+  # separately for the pre-pandemic waves and for 2023
+  dd <- function(data, f) transform(data, female = f, female_x23 = f * data$y2023)
+  p1 <- predict(m, newdata = dd(d[d$y2023 == 0, ], 1), type = "response")
+  p0 <- predict(m, newdata = dd(d[d$y2023 == 0, ], 0), type = "response")
+  q1 <- predict(m, newdata = dd(d[d$y2023 == 1, ], 1), type = "response")
+  q0 <- predict(m, newdata = dd(d[d$y2023 == 1, ], 0), type = "response")
+  est <- c(pre = mean(p1 - p0), post = mean(q1 - q0)); est["diff"] <- est["post"] - est["pre"]
+  # firm-cluster bootstrap for the standard errors: resample whole firms
+  set.seed(1); rows_of <- split(seq_len(nrow(d)), d$key); B <- 199
+  boot <- replicate(B, {
+    s  <- sample(names(rows_of), length(rows_of), replace = TRUE)
+    db <- d[unlist(rows_of[s], use.names = FALSE), ]
+    mb <- try(glm(formula(m), family = binomial(link = "probit"), data = db), silent = TRUE)
+    if (inherits(mb, "try-error")) return(rep(NA, 3))
+    a <- mean(predict(mb, dd(db[db$y2023 == 0, ], 1), type = "response") - predict(mb, dd(db[db$y2023 == 0, ], 0), type = "response"))
+    b <- mean(predict(mb, dd(db[db$y2023 == 1, ], 1), type = "response") - predict(mb, dd(db[db$y2023 == 1, ], 0), type = "response"))
+    c(a, b, b - a)
+  })
+  se <- apply(boot, 1, sd, na.rm = TRUE)
+  probit_ape[[v]] <- data.frame(effect = names(est), estimate = est, se = se)
+  cat("\n====", v, "====\n"); print(probit_ape[[v]], row.names = FALSE, digits = 3)
+}
+```
+
+# Panel estimators on the unbalanced panel
+
+## The unobserved effects model
+
+$$
+y_{it} = \beta_1 F_{it} + \beta_3 (F_{it}\times D^{2023}_t) + \delta_1 D^{2017}_t + \delta_2 D^{2023}_t + \mathbf x_{it}'\boldsymbol\gamma + a_i + u_{it}
+$$
+
+- **Pooled OLS** ignores $a_i$: consistent only if $\text{Cov}(\mathbf x_{it}, a_i)=0$.
+- **Random effects** also assumes $\text{Cov}(\mathbf x_{it}, a_i)=0$ but uses the error structure (FGLS, quasi-demeaning) for efficiency. With an unbalanced panel the quasi-demeaning parameter $\theta_i$ differs by firm, because it depends on the number of waves $T_i$.
+- **Fixed effects** subtracts firm means, $\ddot y_{it} = y_{it} - \bar y_i$, removing $a_i$ and allowing any correlation between $a_i$ and the regressors. Firms observed only once contribute nothing. Time-constant variables (sector, region) drop out.
+
+**What identifies the female coefficients in FE.** $\beta_1$ is identified only by firms whose manager gender changes between waves (the "switchers"). $\beta_3$ is identified by every female-led firm observed both in 2023 and in an earlier wave, because $F_{it}\times D^{2023}_t$ changes from 0 to 1 for those firms even when $F_{it}$ does not change.
+
+**Unbalanced panel.** The FE estimator on an unbalanced panel is consistent if selection $s_{it}$ (whether firm $i$ is observed in wave $t$) is unrelated to the idiosyncratic errors $u_{ir}$ in all periods, conditional on $\mathbf x_i$ and $a_i$. Selection may be correlated with $a_i$. RE additionally requires $a_i$ to be unrelated to selection.
+
+```{r panel}
+panel <- list(); for (v in c("website", "cert")) {
+  P <- pdat(v)
+  panel[[v]] <- list(
+    POLS = pols[[v]],
+    RE   = plm(as.formula(paste(v, "~", rhs_tc)), data = P, model = "random"),
+    FE   = plm(as.formula(paste(v, "~", rhs)),    data = P, model = "within"))
+  cat("\n====", v, "====\n")
+  for (k in names(panel[[v]])) {
+    ct <- coeftest(panel[[v]][[k]], vcov = cl_vcov(panel[[v]][[k]]))
+    cat(sprintf("%-5s female = %7.3f (%.3f)   female x 2023 = %7.3f (%.3f)\n", k,
+                ct["female", 1], ct["female", 2], ct["female_x23", 1], ct["female_x23", 2]))
+  }
+}
+
+# gap in 2023 = beta1 + beta3, with a cluster-robust t-test of the linear combination
+gap23 <- function(m) {
+  V <- cl_vcov(m); b <- coef(m); g <- c(female = 1, female_x23 = 1)
+  est <- sum(b[names(g)]); se <- sqrt(as.numeric(t(g) %*% V[names(g), names(g)] %*% g))
+  c(est = est, se = se, p = 2 * pnorm(-abs(est / se)))
+}
+for (v in c("website", "cert")) for (k in c("POLS", "RE", "FE"))
+  cat(sprintf("%-8s %-5s gap in 2023 = %6.3f (%.3f)  p = %.3f\n", v, k,
+              gap23(panel[[v]][[k]])[1], gap23(panel[[v]][[k]])[2], gap23(panel[[v]][[k]])[3]))
+
+# within-firm variation that identifies the FE gender coefficients, by outcome sample
+for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% group_by(key) %>% filter(n() >= 2) %>%
+    summarise(sw = n_distinct(female) > 1, x23 = n_distinct(female_x23) > 1,
+              x23_stay = x23 & all(female == 1), .groups = "drop")
+  cat(sprintf("%-8s firms >=2 waves: %d | gender switchers: %d | F x 2023 changes: %d (female-led throughout: %d)\n",
+              v, nrow(d), sum(d$sw), sum(d$x23), sum(d$x23_stay)))
+}
+
+# raw gaps with the same wave structure as the model (no controls), for comparison with beta_1
+for (v in c("website", "cert")) {
+  m <- plm(as.formula(paste(v, "~ female + female_x23 + y2017 + y2023")), data = pdat(v), model = "pooling")
+  cat(v, "raw pre-pandemic gap (2010 and 2017 pooled):", round(coef(m)["female"], 3), "\n")
+}
+```
+
+# Mundlak test: random effects or fixed effects?
+
+The course recommends the Mundlak-based (Sargan-type) test over the classical Hausman test. Write the firm effect as a function of the firm averages $\bar{\mathbf w}_i$ of all time-varying regressors (including $F_{it}$ and $F_{it}\times D^{2023}_t$):
+
+$$
+a_i = \bar{\mathbf w}_i'\boldsymbol\xi + d_i
+\quad\Rightarrow\quad
+y_{it} = \mathbf x_{it}'\boldsymbol\beta + \bar{\mathbf w}_i'\boldsymbol\xi + d_i + u_{it}
+$$
+
+Estimate by RE and test $H_0:\boldsymbol\xi=\mathbf 0$ with a cluster-robust Wald test ($\chi^2_M$). Because the panel is unbalanced, the averages of the year dummies differ across firms (they record *which* waves a firm is observed in), so they are included as additional controls, following Wooldridge (2019, *Journal of Econometrics*), and are not part of the tested restriction. Rejection means the firm effects are correlated with the regressors, so RE is inconsistent and FE is preferred. With an unbalanced panel, $\bar{\mathbf w}_i$ is the average over the waves in which firm $i$ is observed. The RE variance components are estimated with the Wallace–Hussain method, because the default Swamy–Arora method runs a between regression in which the firm averages are exactly collinear with the between-transformed regressors.
+
+```{r mundlak}
+wvars <- c("female", "female_x23", ctrl_tv)
+mundlak <- list(); mundlak_xi <- list(); mundlak_gender <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% group_by(key) %>%
+    mutate(across(all_of(c(wvars, "y2017", "y2023")), mean, .names = "{.col}_bar")) %>% ungroup()
+  bars <- paste0(wvars, "_bar")
+  m <- plm(as.formula(paste(v, "~", rhs_tc, "+", paste(bars, collapse = " + "), "+ y2017_bar + y2023_bar")),
+           data = pdata.frame(as.data.frame(d), index = c("key", "year")), model = "random",
+           random.method = "walhus")   # Swamy-Arora is singular here: firm averages equal the between regressors
+  V <- cl_vcov(m)[bars, bars]; b <- coef(m)[bars]
+  stat <- as.numeric(t(b) %*% solve(V) %*% b)
+  mundlak[[v]] <- c(stat = stat, df = length(bars), p = pchisq(stat, length(bars), lower.tail = FALSE))
+  cat(sprintf("%-8s Mundlak chi2(%d) = %.2f   p = %.3f\n", v, length(bars), stat, mundlak[[v]]["p"]))
+  # which firm averages drive the result
+  ct <- coeftest(m, vcov = cl_vcov(m))[bars, c(1, 2, 4)]
+  mundlak_xi[[v]] <- ct
+  print(round(ct, 3))
+  # joint test of the two gender averages only
+  g <- c("female_bar", "female_x23_bar"); Vg <- cl_vcov(m)[g, g]; bg <- coef(m)[g]
+  sg <- as.numeric(t(bg) %*% solve(Vg) %*% bg)
+  mundlak_gender[[v]] <- c(stat = sg, p = pchisq(sg, 2, lower.tail = FALSE))
+  cat(sprintf("  gender averages jointly: chi2(2) = %.2f   p = %.3f\n", sg, mundlak_gender[[v]]["p"]))
+
+  # Mundlak's equivalence: pooled OLS with the averages of ALL time-varying regressors reproduces FE exactly
+  # (without sector and region, which change within 41 firms and are therefore not time-constant here)
+  mp <- plm(as.formula(paste(v, "~", rhs, "+", paste(c(bars, "y2017_bar", "y2023_bar"), collapse = " + "))),
+            data = pdata.frame(as.data.frame(d), index = c("key", "year")), model = "pooling")
+  cat(sprintf("  POLS + averages: female = %.4f, female_x23 = %.4f | FE: %.4f, %.4f\n",
+              coef(mp)["female"], coef(mp)["female_x23"], coef(panel[[v]]$FE)["female"], coef(panel[[v]]$FE)["female_x23"]))
+}
+```
+
+# Strict exogeneity: a lead of manager gender
+
+FE requires $E(u_{it}\mid \mathbf z_{i1},\dots,\mathbf z_{iT},a_i)=0$, so the error today must be unrelated to the regressors in *every* wave, including future manager gender. This would fail if, for example, a firm that unexpectedly falls behind in technology appoints a different manager in the next wave. One implication can be tested: add next wave's manager gender $F_{i,t+1}$ to the FE regression; under strict exogeneity its coefficient is zero (Wooldridge 2010, Chapter 10). "Next" means the adjacent survey wave, so the regression uses 2010 and 2017 observations of firms also observed in the following wave, and the 2023 terms drop out. Only firms with two such observations — i.e. firms observed in all three waves — provide within-firm variation.
+
+```{r strict_exog}
+lead_f <- df %>% select(key, year, female) %>% mutate(year = c(NA, 2010, 2017)[match(year, c(2010, 2017, 2023))]) %>%
+  filter(!is.na(year)) %>% rename(female_lead = female)
+sx <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% filter(year < 2023) %>% inner_join(lead_f, by = c("key", "year")) %>% filter(!is.na(female_lead))
+  rhs_sx <- paste(c("female", "y2017", ctrl_tv, "female_lead"), collapse = " + ")
+  m <- plm(as.formula(paste(v, "~", rhs_sx)), data = pdata.frame(as.data.frame(d), index = c("key", "year")), model = "within")
+  ct <- coeftest(m, vcov = cl_vcov(m))
+  w <- d %>% group_by(key) %>% filter(n() == 2) %>% summarise(lead_var = n_distinct(female_lead) > 1, cur_var = n_distinct(female) > 1, .groups = "drop")
+  sx[[v]] <- c(coef = ct["female_lead", 1], se = ct["female_lead", 2], p = ct["female_lead", 4],
+               obs = nrow(d), firms2 = nrow(w), lead_switch = sum(w$lead_var))
+  cat("\n====", v, "====\n"); print(round(sx[[v]], 3))
+}
+```
+
+# Testing for sample selection in the unbalanced panel
+
+The panel is unbalanced for two reasons: the survey **adds new firms** in each wave (refreshment samples, by design) and some firms **leave** (attrition: closure, refusal, non-contact). Refreshment by design is harmless; attrition is a problem if it is related to the idiosyncratic shocks $u_{it}$.
+
+Following the course lecture (Wooldridge 2010, Section 19.9), under strict exogeneity the selection indicator of another period should not help explain $y_{it}$ once the regressors and $a_i$ are accounted for:
+
+- **FE test with $s_{i,t+1}$ (lead):** add an indicator for whether the firm is observed in the **next** wave. The last wave (2023) is lost. A significant coefficient means that firms that later drop out had different shocks — evidence of attrition bias.
+- **FE test with $s_{i,t-1}$ (lag):** add an indicator for whether the firm was observed in the **previous** wave. The first wave (2010) is lost.
+- **RE test with $T_i$:** add the number of waves in which the firm is observed. It is time-constant, so it cannot be used in FE.
+
+Use a robust t-test in each case. These tests require $T>2$, which the three-wave panel provides.
+
+```{r selection}
+waves <- c(2010, 2017, 2023)
+obs <- df %>% distinct(key, year)
+has <- function(k, yr) paste(k, yr) %in% paste(obs$key, obs$year)
+df <- df %>% mutate(
+  next_wave = c(2017, 2023, NA)[match(year, waves)],
+  prev_wave = c(NA, 2010, 2017)[match(year, waves)],
+  s_lead = ifelse(is.na(next_wave), NA, as.numeric(has(key, next_wave))),
+  s_lag  = ifelse(is.na(prev_wave), NA, as.numeric(has(key, prev_wave)))) %>%
+  group_by(key) %>% mutate(T_i = n()) %>% ungroup()
+
+seltest <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v)
+  dl <- pdata.frame(as.data.frame(filter(d, !is.na(s_lead))), index = c("key", "year"))
+  dg <- pdata.frame(as.data.frame(filter(d, !is.na(s_lag))),  index = c("key", "year"))
+  rhs_lead <- paste(setdiff(strsplit(rhs, " \\+ ")[[1]], c("female_x23", "y2023")), collapse = " + ")  # no 2023 obs
+  m_lead <- plm(as.formula(paste(v, "~", rhs_lead, "+ s_lead")), data = dl, model = "within")
+  m_lag  <- plm(as.formula(paste(v, "~", rhs, "+ s_lag")),       data = dg, model = "within")
+  m_T    <- plm(as.formula(paste(v, "~", rhs_tc, "+ T_i")),      data = pdata.frame(as.data.frame(d), index = c("key", "year")), model = "random")
+  get <- function(m, term) { ct <- coeftest(m, vcov = cl_vcov(m)); ct[term, c(1, 2, 4)] }
+  seltest[[v]] <- rbind(s_lead = get(m_lead, "s_lead"), s_lag = get(m_lag, "s_lag"), T_i = get(m_T, "T_i"))
+  cat("\n====", v, "====\n"); print(round(seltest[[v]], 3))
+}
+```
+
+**How the selection indicators are built.** The professor's example uses consecutive calendar years. Here the waves are 2010, 2017 and 2023, so "next" and "previous" refer to the adjacent *survey wave*: $s_{i,t+1}$ in 2010 is 1 only if the firm is observed in 2017, and $s_{i,t-1}$ in 2023 is 1 only if it is observed in 2017. A firm observed in 2010 and 2023 but not in 2017 therefore has $s_{i,t+1}=0$ in 2010 and $s_{i,t-1}=0$ in 2023. The check below confirms this for such firms, and reports the estimation samples of the lead and lag regressions.
+
+```{r selection_checks}
+# firms observed in 2010 and 2023 but not 2017: both indicators must be 0
+gap_firms <- df %>% group_by(key) %>% filter(all(c(2010, 2023) %in% year), !(2017 %in% year)) %>% ungroup()
+cat("Firms observed 2010 and 2023 only:", n_distinct(gap_firms$key), "\n")
+print(gap_firms %>% count(year, s_lead, s_lag))
+
+# estimation samples of the selection regressions
+for (v in c("website", "cert")) {
+  d  <- est_sample(v)
+  dl <- filter(d, !is.na(s_lead)); dg <- filter(d, !is.na(s_lag))
+  cat(sprintf("%-8s lead: %d obs, %d firms in >=2 waves | lag: %d obs, %d firms in >=2 waves\n", v,
+              nrow(dl), sum(table(dl$key) >= 2), nrow(dg), sum(table(dg$key) >= 2)))
+}
+
+# Holm adjustment across the three diagnostics for each outcome
+for (v in c("website", "cert"))
+  cat(v, "Holm-adjusted p:", round(p.adjust(seltest[[v]][, 3], "holm"), 3), "\n")
+```
+
+# Robustness
+
+## Same sample for all three estimators
+
+Pooled OLS and RE use all firms, whereas FE is identified only by firms observed at least twice. A difference between them can therefore come from the estimator *or* from the sample. Re-estimating pooled OLS and RE on the firms observed at least twice separates the two.
+
+```{r common_sample}
+common <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% group_by(key) %>% filter(n() >= 2) %>% ungroup()
+  P <- pdata.frame(as.data.frame(d), index = c("key", "year"))
+  ms <- list(POLS = plm(as.formula(paste(v, "~", rhs_tc)), data = P, model = "pooling"),
+             RE   = plm(as.formula(paste(v, "~", rhs_tc)), data = P, model = "random"),
+             FE   = panel[[v]]$FE)
+  common[[v]] <- t(sapply(ms, function(m) { ct <- coeftest(m, vcov = cl_vcov(m)); g <- gap23(m)
+    c(b1 = ct["female", 1], se1 = ct["female", 2], b3 = ct["female_x23", 1], se3 = ct["female_x23", 2],
+      gap = g[["est"]], se_gap = g[["se"]], p_gap = g[["p"]], n = nobs(m)) }))
+  cat("\n====", v, "(firms in >= 2 waves) ====\n"); print(round(common[[v]], 3))
+}
+```
+
+## How close is RE to pooled OLS?
+
+The RE quasi-demeaning parameter $\theta_i = 1-\sqrt{\sigma_u^2/(\sigma_u^2+T_i\sigma_a^2)}$ depends on the estimated variance components and on $T_i$.
+
+```{r theta}
+for (v in c("website", "cert")) {
+  m <- panel[[v]]$RE; ec <- ercomp(m)
+  th <- ec$theta; if (is.list(th)) th <- th$id
+  cat(sprintf("%-8s sigma2_a = %.3f  sigma2_u = %.3f  share of var. from a_i = %.2f\n", v,
+              ec$sigma2[["id"]], ec$sigma2[["idios"]], ec$sigma2[["id"]] / sum(ec$sigma2)))
+  print(round(tapply(th, table(index(m)[[1]])[as.character(index(m)[[1]])], mean), 3))
+}
+```
+
+## Sector and region changes within firms
+
+41 repeated firms have a different broad sector in different waves, and 4 a different region. The table shows between which waves and codes the changes occur.
+
+```{r sector_changes}
+raw_sector <- bind_rows(
+  old %>% filter(year == 2010) %>% transmute(key, year = 2010, code = paste0("ISIC ", as.numeric(a4b))),
+  new %>% transmute(key, year = as.numeric(year), code = as.character(as_factor(a4a))))
+changers <- df %>% group_by(key) %>% filter(n() >= 2, n_distinct(sector) > 1) %>% ungroup() %>%
+  select(key, year, sector) %>% left_join(raw_sector, by = c("key", "year")) %>% arrange(key, year)
+# between which waves does the broad sector change?
+changers %>% group_by(key) %>%
+  summarise(change = paste(year[-1][sector[-1] != sector[-n()]], collapse = ","), .groups = "drop") %>% count(change)
+# raw codes before and after the change (2017 -> 2023)
+changers %>% filter(year %in% c(2017, 2023)) %>% group_by(key) %>%
+  summarise(path = paste(code, collapse = " -> "), .groups = "drop") %>% count(path, sort = TRUE)
+```
+
+All changes occur between 2017 and 2023, where both waves use the same sampling-sector variable (`a4a`), and none between 2010 and 2017, where the coding changes. The harmonisation of the 2010 ISIC codes is therefore not the source. Most changes are between retail and other services. Whether they reflect real changes in activity or a different sector assignment in the 2023 sample frame cannot be determined from the data. If they are real, sector is time-varying and should be controlled for in FE as well, so FE is re-estimated with sector and region dummies.
+
+```{r fe_sector}
+fe_sr <- list(); for (v in c("website", "cert")) {
+  m <- plm(as.formula(paste(v, "~", rhs, "+ sector + region")), data = pdat(v), model = "within")
+  ct <- coeftest(m, vcov = cl_vcov(m)); g <- gap23(m)
+  fe_sr[[v]] <- c(b1 = ct["female", 1], se1 = ct["female", 2], b3 = ct["female_x23", 1], se3 = ct["female_x23", 2],
+                  gap = g[["est"]], se_gap = g[["se"]])
+  cat("\n====", v, "FE with sector and region ====\n"); print(round(fe_sr[[v]], 3))
+}
+```
+
+## Separate gender gaps in 2010 and 2017
+
+The main model pools 2010 and 2017 into one pre-pandemic gap. Adding $F_{it}\times D^{2017}_t$ lets the 2017 gap differ from the 2010 gap.
+
+```{r sep2017}
+sep17 <- list(); sep17_models <- list(); for (v in c("website", "cert")) {
+  d <- est_sample(v) %>% mutate(female_x17 = female * y2017)
+  P <- pdata.frame(as.data.frame(d), index = c("key", "year"))
+  ms <- list(POLS = plm(as.formula(paste(v, "~", rhs_tc, "+ female_x17")), data = P, model = "pooling"),
+             RE   = plm(as.formula(paste(v, "~", rhs_tc, "+ female_x17")), data = P, model = "random"),
+             FE   = plm(as.formula(paste(v, "~", rhs,    "+ female_x17")), data = P, model = "within"))
+  sep17_models[[v]] <- ms
+  sep17[[v]] <- t(sapply(ms, function(m) { ct <- coeftest(m, vcov = cl_vcov(m))
+    c(female = ct["female", 1], x17 = ct["female_x17", 1], se17 = ct["female_x17", 2], p17 = ct["female_x17", 4],
+      x23 = ct["female_x23", 1], se23 = ct["female_x23", 2]) }))
+  cat("\n====", v, "====\n"); print(round(sep17[[v]], 3))
+}
+```
+
+# Tables for the paper
+
+```{r export}
+num <- function(x, d = 3) { s <- formatC(x, format = "f", digits = d); ifelse(substr(s, 1, 1) == "-", paste0("$-$", substring(s, 2)), s) }
+stars <- function(p) ifelse(p < 0.01, "$^{***}$", ifelse(p < 0.05, "$^{**}$", ifelse(p < 0.10, "$^{*}$", "")))
+writeLines2 <- function(x, f) writeLines(x, file.path("tables", f))
+
+# ---- Table 1: descriptives by wave and manager gender
+rows <- c(names(desc_vars), "manuf", "retail")
+labs <- c(desc_vars, manuf = "Manufacturing", retail = "Retail")
+L <- c("\\begin{tabular}{lcccccc}", "\\toprule",
+       " & \\multicolumn{2}{c}{2010} & \\multicolumn{2}{c}{2017} & \\multicolumn{2}{c}{2023} \\\\",
+       "\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}\\cmidrule(lr){6-7}",
+       " & Male-led & Female-led & Male-led & Female-led & Male-led & Female-led \\\\", "\\midrule")
+for (r in rows) {
+  vals <- sapply(c(2010, 2017, 2023), function(t) sapply(c(0, 1), function(f) desc[[r]][desc$year == t & desc$female == f]))
+  dg <- ifelse(r %in% c("l1", "mgr_exp"), 1, 3)
+  L <- c(L, paste0(labs[r], " & ", paste(num(as.vector(vals), dg), collapse = " & "), " \\\\"))
+  if (r == "cert") L <- c(L, "\\addlinespace")
+}
+nrow_ <- sapply(c(2010, 2017, 2023), function(t) sapply(c(0, 1), function(f) desc$n[desc$year == t & desc$female == f]))
+L <- c(L, "\\midrule", paste0("Firms & ", paste(format(as.vector(nrow_), big.mark = ","), collapse = " & "), " \\\\"), "\\bottomrule", "\\end{tabular}")
+writeLines2(L, "tab1_desc.tex")
+
+# ---- Table 2: POLS / RE / FE for both outcomes (+ probit APEs)
+terms <- c(female = "Female manager ($\\beta_1$)", female_x23 = "Female $\\times$ 2023 ($\\beta_3$)",
+           y2017 = "2017", y2023 = "2023", ln_emp = "log employees", mgr_exp = "Manager experience",
+           exporter = "Exporter", foreign = "Foreign owned")
+cols <- list(); for (v in c("website", "cert")) for (k in c("POLS", "RE", "FE")) cols[[paste(v, k)]] <- panel[[v]][[k]]
+L <- c("\\begin{tabular}{lcccccc}", "\\toprule",
+       " & \\multicolumn{3}{c}{Own website} & \\multicolumn{3}{c}{Quality certification} \\\\",
+       "\\cmidrule(lr){2-4}\\cmidrule(lr){5-7}",
+       " & POLS & RE & FE & POLS & RE & FE \\\\", " & (1) & (2) & (3) & (4) & (5) & (6) \\\\", "\\midrule")
+for (t in names(terms)) {
+  e <- s <- c()
+  for (m in cols) {
+    ct <- coeftest(m, vcov = cl_vcov(m))
+    if (t %in% rownames(ct)) {
+      dg <- ifelse(t == "mgr_exp", 4, 3)
+      e <- c(e, paste0(num(ct[t, 1], dg), stars(ct[t, 4]))); s <- c(s, paste0("(", num(ct[t, 2], dg), ")"))
+    } else { e <- c(e, ""); s <- c(s, "") }
+  }
+  L <- c(L, paste0(terms[t], " & ", paste(e, collapse = " & "), " \\\\"), paste0(" & ", paste(s, collapse = " & "), " \\\\"))
+}
+fe_n  <- function(m) length(unique(index(m)[[1]]))
+fe_n2 <- function(m) sum(table(index(m)[[1]]) >= 2)
+g23 <- sapply(cols, function(m) { g <- gap23(m); c(paste0(num(g[1]), stars(g[3])), paste0("(", num(g[2]), ")")) })
+L <- c(L, paste0("Gap in 2023 ($\\beta_1+\\beta_3$) & ", paste(g23[1, ], collapse = " & "), " \\\\"),
+       paste0(" & ", paste(g23[2, ], collapse = " & "), " \\\\"),
+       "\\midrule",
+       "Sector and region dummies & Yes & Yes & -- & Yes & Yes & -- \\\\",
+       paste0("Observations & ", paste(sapply(cols, function(m) format(nobs(m), big.mark = ",")), collapse = " & "), " \\\\"),
+       paste0("Firms & ", paste(sapply(cols, function(m) format(fe_n(m), big.mark = ",")), collapse = " & "), " \\\\"),
+       paste0("Firms in $\\geq$2 waves & ", paste(sapply(cols, function(m) format(fe_n2(m), big.mark = ",")), collapse = " & "), " \\\\"),
+       "\\midrule", "\\multicolumn{7}{l}{\\textit{Probit average partial effect of a female manager}} \\\\")
+pa <- function(v, e) { r <- probit_ape[[v]][probit_ape[[v]]$effect == e, ]; z <- r$estimate / r$se
+  c(paste0(num(r$estimate), stars(2 * pnorm(-abs(z)))), paste0("(", num(r$se), ")")) }
+for (e in c("pre", "post", "diff")) {
+  lab <- c(pre = "2010 and 2017", post = "2023", diff = "Change, 2023 vs.\\ earlier")[e]
+  a <- pa("website", e); b <- pa("cert", e)
+  L <- c(L, paste0(lab, " & ", a[1], " & & & ", b[1], " & & \\\\"), paste0(" & ", a[2], " & & & ", b[2], " & & \\\\"))
+}
+L <- c(L, "\\bottomrule", "\\end{tabular}")
+writeLines2(L, "tab2_main.tex")
+
+# ---- Table 3: specification and selection tests
+L <- c("\\begin{tabular}{lcc}", "\\toprule", " & Own website & Quality certification \\\\", "\\midrule",
+       "\\multicolumn{3}{l}{\\textit{Panel A: Mundlak test of RE against FE}} \\\\",
+       paste0("$\\chi^2$ statistic (df $=", mundlak$website["df"], "$) & ", num(mundlak$website["stat"], 2), " & ", num(mundlak$cert["stat"], 2), " \\\\"),
+       paste0("$p$-value & ", num(mundlak$website["p"]), " & ", num(mundlak$cert["p"]), " \\\\"),
+       "\\midrule", "\\multicolumn{3}{l}{\\textit{Panel B: Selection tests (coefficient on selection indicator)}} \\\\")
+for (s in c("s_lead", "s_lag", "T_i")) {
+  lab <- c(s_lead = "FE + $s_{i,t+1}$ (observed in next wave)", s_lag = "FE + $s_{i,t-1}$ (observed in previous wave)", T_i = "RE + $T_i$ (number of waves observed)")[s]
+  a <- seltest$website[s, ]; b <- seltest$cert[s, ]
+  L <- c(L, paste0(lab, " & ", num(a[1]), stars(a[3]), " & ", num(b[1]), stars(b[3]), " \\\\"),
+         paste0(" & (", num(a[2]), ") & (", num(b[2]), ") \\\\"))
+}
+L <- c(L, "\\bottomrule", "\\end{tabular}")
+writeLines2(L, "tab3_tests.tex")
+
+# ---- Table 4: robustness -- common sample and separate 2017 gap
+cell <- function(b, se, p = 2 * pnorm(-abs(b / se))) c(paste0(num(b), stars(p)), paste0("(", num(se), ")"))
+L <- c("\\begin{tabular}{lcccccc}", "\\toprule",
+       " & \\multicolumn{3}{c}{Own website} & \\multicolumn{3}{c}{Quality certification} \\\\",
+       "\\cmidrule(lr){2-4}\\cmidrule(lr){5-7}",
+       " & POLS & RE & FE & POLS & RE & FE \\\\", "\\midrule",
+       "\\multicolumn{7}{l}{\\textit{Panel A: firms observed in at least two waves}} \\\\")
+for (r in list(c("b1", "se1", "Female manager ($\\beta_1$)"), c("b3", "se3", "Female $\\times$ 2023 ($\\beta_3$)"),
+               c("gap", "se_gap", "Gap in 2023 ($\\beta_1+\\beta_3$)"))) {
+  cc <- sapply(c("website", "cert"), function(v) sapply(c("POLS", "RE", "FE"), function(k) cell(common[[v]][k, r[1]], common[[v]][k, r[2]])))
+  cc <- matrix(cc, nrow = 2)
+  L <- c(L, paste0(r[3], " & ", paste(cc[1, ], collapse = " & "), " \\\\"), paste0(" & ", paste(cc[2, ], collapse = " & "), " \\\\"))
+}
+L <- c(L, paste0("Contributing observations & ", paste(rep(c(common$website["POLS", "n"], common$cert["POLS", "n"]), each = 3) |> format(big.mark = ","), collapse = " & "), " \\\\"),
+       "\\midrule", "\\multicolumn{7}{l}{\\textit{Panel B: separate female--male gap in 2017 (full sample)}} \\\\")
+for (r in list(c("female", NA, "Female manager (2010 gap)"), c("x17", "se17", "Female $\\times$ 2017"), c("x23", "se23", "Female $\\times$ 2023"))) {
+  if (is.na(r[2])) {
+    se <- sapply(c("website", "cert"), function(v) sapply(c("POLS", "RE", "FE"), function(k) { m <- sep17_models[[v]][[k]]; sqrt(cl_vcov(m)["female", "female"]) }))
+  } else se <- sapply(c("website", "cert"), function(v) sep17[[v]][, r[2]])
+  b <- sapply(c("website", "cert"), function(v) sep17[[v]][, r[1]])
+  cc <- matrix(sapply(seq_along(b), function(j) cell(b[j], se[j])), nrow = 2)
+  L <- c(L, paste0(r[3], " & ", paste(cc[1, ], collapse = " & "), " \\\\"), paste0(" & ", paste(cc[2, ], collapse = " & "), " \\\\"))
+}
+L <- c(L, "\\bottomrule", "\\end{tabular}")
+writeLines2(L, "tab4_robust.tex")
+list.files("tables")
+```
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
